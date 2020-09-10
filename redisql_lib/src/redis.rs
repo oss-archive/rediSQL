@@ -1,5 +1,4 @@
 use fnv::FnvHashMap;
-use std;
 use std::clone::Clone;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -88,6 +87,10 @@ pub trait StatementCache<'a> {
         identifier: &str,
         args: &[&str],
     ) -> Result<Cursor, RediSQLError>;
+    fn show_statement(
+        &self,
+        identifier: &str,
+    ) -> Result<QueryResult, RediSQLError>;
     fn list_statements(&self) -> Result<QueryResult, RediSQLError>;
 }
 
@@ -241,6 +244,47 @@ impl<'a> StatementCache<'a> for ReplicationBook {
                 let stmt = bind_statement(stmt, args)?;
                 let cursor = stmt.execute()?;
                 Ok(cursor)
+            }
+        }
+    }
+    fn show_statement(
+        &self,
+        identifier: &str,
+    ) -> Result<QueryResult, RediSQLError> {
+        let map = self.data.read().unwrap();
+        match map.get(identifier) {
+            None => {
+                let debug = String::from("No statement found");
+                let description = String::from(
+                    "The statement is not present in the database",
+                );
+                Err(RediSQLError::new(debug, description))
+            }
+            Some(&(ref stmt, read_only)) => {
+                let names = vec![
+                    "identifier".to_string(),
+                    "SQL".to_string(),
+                    "parameters_count".to_string(),
+                    "read_only".to_string(),
+                ];
+                let types = vec!["TEXT", "TEXT", "INT", "INT"];
+                let array = vec![
+                    Entity::Text {
+                        text: identifier.to_string(),
+                    },
+                    Entity::Text { text: stmt.sql() },
+                    Entity::Integer {
+                        int: stmt.parameters_count() as i64,
+                    },
+                    Entity::Integer {
+                        int: if read_only { 1 } else { 0 },
+                    },
+                ];
+                Ok(QueryResult::Array {
+                    names,
+                    types,
+                    array,
+                })
             }
         }
     }
@@ -550,8 +594,7 @@ impl RedisKey {
                             .unwrap()(self.key)
                             as *mut DBKey
                     };
-                    let dbkey = { &*dbkey };
-                    dbkey
+                    &*dbkey
                 };
                 Ok(dbkey)
             }
@@ -570,7 +613,7 @@ impl RedisKey {
         &self,
     ) -> Result<ConcurrentConnection, RediSQLError> {
         let dbkey = self.get_dbkey()?;
-        Ok(dbkey.loop_data.get_db().clone())
+        Ok(dbkey.loop_data.get_db())
     }
     pub fn get_loop_data(&self) -> Result<Loop, RediSQLError> {
         let dbkey = self.get_dbkey()?;
@@ -597,12 +640,14 @@ pub enum Command {
     Stop,
     Exec {
         query: &'static str,
+        arguments: Vec<&'static str>,
         timeout: std::time::Instant,
         return_method: ReturnMethod,
         client: BlockedClient,
     },
     Query {
         query: &'static str,
+        arguments: Vec<&'static str>,
         timeout: std::time::Instant,
         return_method: ReturnMethod,
         client: BlockedClient,
@@ -634,6 +679,11 @@ pub enum Command {
         identifier: &'static str,
         arguments: Vec<&'static str>,
         timeout: std::time::Instant,
+        return_method: ReturnMethod,
+        client: BlockedClient,
+    },
+    ShowStatement {
+        identifier: &'static str,
         return_method: ReturnMethod,
         client: BlockedClient,
     },
@@ -1050,8 +1100,11 @@ impl RedisReply for QueryResult {
 pub fn do_execute(
     db: &ConcurrentConnection,
     query: &str,
+    args: &Vec<&str>,
 ) -> Result<impl Returner, err::RediSQLError> {
-    let stmt = MultiStatement::new(db.clone(), query)?;
+    let mut stmt = MultiStatement::new(db.clone(), query)?;
+    stmt.reset();
+    let stmt = bind_statement(&mut stmt, args)?;
     debug!("do_execute | created statement");
     let cursor = stmt.execute()?;
     debug!("do_execute | statement executed");
@@ -1061,9 +1114,12 @@ pub fn do_execute(
 pub fn do_query(
     db: &ConcurrentConnection,
     query: &str,
+    args: &Vec<&str>,
 ) -> Result<impl Returner, err::RediSQLError> {
-    let stmt = MultiStatement::new(db.clone(), query)?;
+    let mut stmt = MultiStatement::new(db.clone(), query)?;
     if stmt.is_read_only() {
+        stmt.reset();
+        let stmt = bind_statement(&mut stmt, args)?;
         Ok(stmt.execute()?)
     } else {
         let debug = String::from("Not read only statement");
@@ -1325,12 +1381,14 @@ pub fn listen_and_execute<'a, L: 'a + LoopData>(
             Ok(Command::Ping {}) => debug!("Received PING!"),
             Ok(Command::Exec {
                 query,
+                arguments,
                 client,
                 return_method,
                 timeout,
             }) => {
                 debug!("Exec | Query = {:?}", query);
-                let result = do_execute(&loopdata.get_db(), query);
+                let result =
+                    do_execute(&loopdata.get_db(), query, &arguments);
                 match result {
                     Ok(_) => STATISTICS.exec_ok(),
                     Err(_) => STATISTICS.exec_err(),
@@ -1345,12 +1403,14 @@ pub fn listen_and_execute<'a, L: 'a + LoopData>(
             }
             Ok(Command::Query {
                 query,
+                arguments,
                 timeout,
                 return_method,
                 client,
             }) => {
                 debug!("Query | Query = {:?}", query);
-                let result = do_query(&loopdata.get_db(), query);
+                let result =
+                    do_query(&loopdata.get_db(), query, &arguments);
 
                 match (&return_method, &result) {
                     (ReturnMethod::Reply, Ok(_)) => {
@@ -1520,6 +1580,18 @@ pub fn listen_and_execute<'a, L: 'a + LoopData>(
                     timeout,
                 );
             }
+            Ok(Command::ShowStatement {
+                identifier,
+                return_method,
+                client,
+            }) => {
+                let result = loopdata
+                    .get_replication_book()
+                    .show_statement(identifier);
+                let t = std::time::Instant::now()
+                    + std::time::Duration::from_secs(10);
+                return_value(&client, &return_method, result, t);
+            }
             Ok(Command::ListStatements {
                 return_method,
                 client,
@@ -1620,7 +1692,7 @@ impl<'c> DBKey<'c> {
     ) -> Self {
         let loop_data = Loop::new_from_arc(db);
         DBKey {
-            tx: tx,
+            tx,
             loop_data,
             connections: HashMap::new(),
             context: None,

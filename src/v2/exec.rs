@@ -84,9 +84,7 @@ fn do_exec_v2(command: Exec<'static>, context: Context) -> i32 {
                         r::rm::ffi::REDISMODULE_OK
                     }
                     Ok(_) => {
-                        if repl_args.is_some() {
-                            let repl_args = repl_args.unwrap();
-
+                        if let Some(repl_args) = repl_args {
                             let command =
                                 CString::new("REDISQL.V2.EXEC")
                                     .unwrap();
@@ -117,10 +115,11 @@ fn do_exec_v2(command: Exec<'static>, context: Context) -> i32 {
         };
         let read_only = command.is_read_only();
         let return_method = command.get_return_method();
-        match command.get_to_execute() {
-            ToExecute::Command(s) => {
+        let to_execute = command.get_to_execute();
+        match to_execute {
+            ToExecute::Command { query, args } => {
                 let mut res = match read_only {
-                    true => match do_query(&db, s) {
+                    true => match do_query(&db, query, args) {
                         Ok(r) => r.create_data_to_return(
                             &context,
                             &return_method,
@@ -132,7 +131,7 @@ fn do_exec_v2(command: Exec<'static>, context: Context) -> i32 {
                             t,
                         ),
                     },
-                    false => match do_execute(&db, s) {
+                    false => match do_execute(&db, query, args) {
                         Ok(r) => {
                             ReplicateVerbatim(&context);
                             r.create_data_to_return(
@@ -150,7 +149,7 @@ fn do_exec_v2(command: Exec<'static>, context: Context) -> i32 {
                 };
                 res.reply_v2(&context)
             }
-            ToExecute::Statement(id) => {
+            ToExecute::Statement { stmt, args } => {
                 let loop_data = match key.get_loop_data() {
                     Ok(k) => k,
                     Err(mut e) => return e.reply_v2(&context),
@@ -160,7 +159,7 @@ fn do_exec_v2(command: Exec<'static>, context: Context) -> i32 {
                     true => {
                         match loop_data
                             .get_replication_book()
-                            .query_statement(&id, &command.args)
+                            .query_statement(stmt, args)
                         {
                             Ok(r) => r.create_data_to_return(
                                 &context,
@@ -177,7 +176,7 @@ fn do_exec_v2(command: Exec<'static>, context: Context) -> i32 {
                     false => {
                         match loop_data
                             .get_replication_book()
-                            .exec_statement(&id, &command.args)
+                            .exec_statement(stmt, args)
                         {
                             Ok(r) => r.create_data_to_return(
                                 &context,
